@@ -12,3 +12,14 @@ run `pip install -r requirements.txt`
 
 ## Step:3
 run main.py file.
+
+## Step:4 
+heavy optimization/rework required.
+
+## Step:5 
+List out what changes, rewrites and tasks we need to do in the Task Section and we'll slowy work on it to.
+
+TASK SECTION:
+1) Replace JSON storage with sqlite
+2) remove high storage that are not really needed or optional such as pytorch, ultralytics etc
+3) Need work on the UI & UX
