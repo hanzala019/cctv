@@ -21,5 +21,6 @@ List out what changes, rewrites and tasks we need to do in the Task Section and 
 
 TASK SECTION:
 1) Replace JSON storage with sqlite
-2) remove high storage that are not really needed or optional such as pytorch, ultralytics etc
+2) Remove high storage that are not really needed or optional such as pytorch, ultralytics etc
 3) Need work on the UI & UX
+4) Add users, authentication and authorization
