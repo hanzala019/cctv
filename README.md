@@ -17,7 +17,7 @@ run main.py file.
 heavy optimization/rework required.
 
 ## Step:5 
-List out what changes, rewrites and tasks we need to do in the Task Section and we'll slowy work on it to.
+List out what changes, rewrites and tasks we need to do in the Task Section and we'll slowly work on it to.
 
 TASK SECTION:
 1) Replace JSON storage with sqlite
