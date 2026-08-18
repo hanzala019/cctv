@@ -53,7 +53,19 @@ DEFAULT_DB_PATH = os.path.join(os.path.expanduser("~"), ".cctv_viewer_events.db"
 # recording_manager.py uses for segment thumbnails. Beside the
 # project's .py files, not the home directory or cwd -- see
 # recording_manager.py's FOOTAGE_ROOT for the same reasoning.
-_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+import sys
+
+def _project_dir():
+    """Directory the exe/script actually lives in -- for a PyInstaller
+    onefile build, sys.executable is the real exe location (not the
+    temporary _MEIPASS extraction folder __file__ would resolve to),
+    so footage/thumbnails persist next to the exe across runs instead
+    of vanishing when the temp extraction folder is cleaned up."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+_PROJECT_DIR = _project_dir()
 EVENT_THUMBNAILS_ROOT = os.path.join(_PROJECT_DIR, "event_thumbnails")
 
 

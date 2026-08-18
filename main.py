@@ -84,6 +84,12 @@ from ui_theme import (
     button_style as _button_style,
     input_style as _input_style,
 )
+
+import os
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000"
+)
 from settings_panel import SettingsPanel, ObjectDetectionSectionPanel
 
 POLL_INTERVAL_MS = 33  # ~30 FPS UI refresh rate

@@ -1,0 +1,20 @@
+@"
+__pycache__/
+*.pyc
+
+venv/
+venv-app/
+
+build/
+dist/
+installer_output/
+
+*.db
+cctv_viewer_cameras.json
+
+cctv_viewer_footage/
+event_thumbnails/
+
+*.pt
+*.onnx
+"@ | Out-File -Encoding utf8 .gitignore

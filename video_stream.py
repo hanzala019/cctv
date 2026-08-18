@@ -223,11 +223,16 @@ class StreamWorker:
     @classmethod
     def _looks_corrupt(cls, frame, last_good_frame):
         if last_good_frame is None:
-            return False  # nothing to compare against yet; let it through
+            return False
         if frame.shape != last_good_frame.shape:
-            return True  # decoder returned a differently-shaped buffer
-
-        diff = cv2.absdiff(frame, last_good_frame)
+            return True
+        # Compare a small downsampled thumbnail instead of the full frame --
+        # a corrupt/garbled frame is just as detectable at 64px as at full
+        # resolution, and this keeps the read loop fast enough to actually
+        # drain the stream in real time instead of falling behind it.
+        small_a = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_NEAREST)
+        small_b = cv2.resize(last_good_frame, (64, 64), interpolation=cv2.INTER_NEAREST)
+        diff = cv2.absdiff(small_a, small_b)
         return float(diff.mean()) > cls.CORRUPTION_DIFF_THRESHOLD
 
     def _wait_or_stop(self, seconds):

@@ -123,13 +123,22 @@ API shape, not against a live camera/model.
 """
 
 import collections
+import os
+import sys
 import threading
 import time
-from ultralytics import YOLO
 import cv2
-import torch
+import numpy as np
+import onnxruntime as ort
 from motion_detector import _denormalize_polygon  # reuse the same normalized -> pixel helper
 
+
+def resource_path(relative_path):
+    """Resolve a path to a bundled resource, working both in normal
+    dev runs and inside a PyInstaller --onefile exe (which extracts
+    --add-data files into a temp _MEIPASS folder at runtime)."""
+    base_path = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base_path, relative_path)
 
 class DetectionMode:
     ON_MOTION = "on_motion"
@@ -164,7 +173,7 @@ STILL_HERE_CONFIRMATION_INTERVAL_SECONDS = 10.0
 
 CROP_PADDING_FRACTION = 0.15  # 15% larger in each dimension, centered on the zone's own bounding box
 CHECK_INTERVAL_SECONDS = 0.2  # cadence for checking motion state / continuous timing -- matches MotionWorker
-MODEL_WEIGHTS = "yolov8n.pt"
+MODEL_WEIGHTS = resource_path("yolov8n.onnx")
 
 # Quality-of-life: a small preview image of what triggered each
 # detection, shown as a thumbnail in the side panel's log. Captured
@@ -234,34 +243,326 @@ class DetectionEvent:
             return f"[{ts}] {self.camera_name}: {self.class_name} detected in {where} ({pct})"
         return f"[{ts}] {self.camera_name}: {self.class_name} still in {where} ({pct})"
 
+# ---------------------------------------------------------------------------
+# ONNX Runtime YOLOv8 detector
+# ---------------------------------------------------------------------------
 
 _model_lock = threading.Lock()
 _shared_model = None
 _model_load_failed = False
 
+PERSON_CLASS_ID = 0
+
+# COCO class names used by yolov8n.onnx
+COCO_CLASSES = [
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
+]
+
+
+class ONNXYOLODetector:
+    def __init__(
+        self,
+        model_path,
+        input_size=640,
+        conf_threshold=0.01,
+        iou_threshold=0.45,
+    ):
+        self.input_size = input_size
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+
+        self.session = ort.InferenceSession(
+            model_path,
+            providers=["CPUExecutionProvider"],
+        )
+
+        self.input_name = self.session.get_inputs()[0].name
+
+    def _letterbox(self, frame):
+        h, w = frame.shape[:2]
+
+        scale = self.input_size / max(h, w)
+
+        new_w = int(round(w * scale))
+        new_h = int(round(h * scale))
+
+        resized = cv2.resize(
+            frame,
+            (new_w, new_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        canvas = np.full(
+            (self.input_size, self.input_size, 3),
+            114,
+            dtype=np.uint8,
+        )
+
+        pad_x = (self.input_size - new_w) // 2
+        pad_y = (self.input_size - new_h) // 2
+
+        canvas[
+            pad_y:pad_y + new_h,
+            pad_x:pad_x + new_w,
+        ] = resized
+
+        return canvas, scale, pad_x, pad_y
+
+    def detect(self, frame_bgr):
+        """
+        Returns:
+
+            [
+                (class_name, confidence, (x1, y1, x2, y2)),
+                ...
+            ]
+
+        Coordinates are in the original frame's pixel space.
+        """
+
+        if frame_bgr is None or frame_bgr.size == 0:
+            return []
+
+        original_h, original_w = frame_bgr.shape[:2]
+
+        image, scale, pad_x, pad_y = self._letterbox(frame_bgr)
+
+        # BGR -> RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # uint8 -> float32 [0, 1]
+        image = image.astype(np.float32) / 255.0
+
+        # HWC -> CHW -> NCHW
+        image = image.transpose(2, 0, 1)
+        image = np.expand_dims(image, axis=0)
+
+        outputs = self.session.run(
+            None,
+            {self.input_name: image},
+        )
+
+        output = outputs[0]
+
+        # YOLOv8 exported output is normally:
+        #
+        # (1, 84, 8400)
+        #
+        # Convert to:
+        #
+        # (8400, 84)
+        if output.ndim == 3:
+            output = output[0]
+
+        if output.shape[0] < output.shape[1]:
+            output = output.T
+
+        detections = []
+
+        boxes = []
+        scores = []
+        class_ids = []
+
+        for row in output:
+            if len(row) < 5:
+                continue
+
+            cx, cy, width, height = row[:4]
+
+            class_scores = row[4:]
+
+            if class_scores.size == 0:
+                continue
+
+            class_id = int(np.argmax(class_scores))
+            confidence = float(class_scores[class_id])
+
+            if confidence < self.conf_threshold:
+                continue
+
+            if class_id >= len(COCO_CLASSES):
+                continue
+
+            # Convert xywh -> xyxy in letterboxed image coordinates
+            x1 = cx - width / 2
+            y1 = cy - height / 2
+            x2 = cx + width / 2
+            y2 = cy + height / 2
+
+            # Remove letterbox padding
+            x1 = (x1 - pad_x) / scale
+            y1 = (y1 - pad_y) / scale
+            x2 = (x2 - pad_x) / scale
+            y2 = (y2 - pad_y) / scale
+
+            # Clamp to original frame
+            x1 = max(0.0, min(float(original_w), x1))
+            y1 = max(0.0, min(float(original_h), y1))
+            x2 = max(0.0, min(float(original_w), x2))
+            y2 = max(0.0, min(float(original_h), y2))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            boxes.append([
+                float(x1),
+                float(y1),
+                float(x2 - x1),
+                float(y2 - y1),
+            ])
+
+            scores.append(confidence)
+            class_ids.append(class_id)
+
+        if not boxes:
+            return []
+
+        # NMS is done across all classes here.
+        indices = cv2.dnn.NMSBoxes(
+            boxes,
+            scores,
+            self.conf_threshold,
+            self.iou_threshold,
+        )
+
+        if len(indices) == 0:
+            return []
+
+        for idx in np.array(indices).flatten():
+            x, y, w, h = boxes[idx]
+
+            class_id = class_ids[idx]
+
+            detections.append(
+                (
+                    COCO_CLASSES[class_id],
+                    scores[idx],
+                    (
+                        x,
+                        y,
+                        x + w,
+                        y + h,
+                    ),
+                )
+            )
+
+        return detections
+
 
 def _get_model():
-    """Lazily load the single shared YOLOv8n model on first use. The
-    ultralytics package downloads yolov8n.pt automatically on first
-    load if it isn't already cached locally -- that first load needs
-    network access. Returns None (and remembers not to retry) if the
-    package/model can't be loaded, so callers can skip inference
-    quietly instead of crashing worker threads repeatedly."""
+    """
+    Lazily load the shared YOLOv8n ONNX model.
+
+    Unlike the previous implementation this does not import or use:
+        - torch
+        - torchvision
+        - ultralytics
+
+    Inference is performed entirely by ONNX Runtime on CPU.
+    """
+
     global _shared_model, _model_load_failed
+
     if _shared_model is not None or _model_load_failed:
         return _shared_model
+
     with _model_lock:
         if _shared_model is None and not _model_load_failed:
             try:
-                _shared_model = YOLO(MODEL_WEIGHTS)
-                device = "cuda:0" if torch.cuda.is_available() else "cpu"
-                _shared_model.to(device)
-                print(f"[object_detector] Using device: {device}")
-            except Exception as exc:  # pragma: no cover - defensive
-                print(f"[object_detector] Failed to load YOLO model: {exc}")
-                _model_load_failed = True
-    return _shared_model
+                _shared_model = ONNXYOLODetector(MODEL_WEIGHTS)
 
+                print(
+                    "[object_detector] "
+                    "Using YOLOv8n ONNX Runtime on CPU"
+                )
+
+            except Exception as exc:
+                print(
+                    "[object_detector] "
+                    f"Failed to load ONNX model: {exc}"
+                )
+                _model_load_failed = True
+
+    return _shared_model
 
 def _zone_bbox_pixels(zone, frame_w, frame_h, padding_fraction=CROP_PADDING_FRACTION):
     """Given a zone dict (normalized points) and the frame's actual
@@ -470,74 +771,179 @@ class ObjectDetectionWorker:
 
     # ----- actual inference + multi-instance event construction --------
 
-    def _run_inference(self, camera, crop_bgr, offset, region_key, zone, frame_w, frame_h):
+    def _run_inference(
+        self,
+        camera,
+        crop_bgr,
+        offset,
+        region_key,
+        zone,
+        frame_w,
+        frame_h,
+    ):
         if crop_bgr is None or crop_bgr.size == 0:
             return
 
-        allowed_classes = set(camera.get("object_detection_classes", []) or [])
+        allowed_classes = set(
+            camera.get("object_detection_classes", []) or []
+        )
+
         if not allowed_classes:
-            return  # nothing configured to look for -- skip inference entirely
+            return
 
         model = _get_model()
+
         if model is None:
+            print(
+                f"[object_detector] cam={self.cam_id} "
+                "skipping inference: model not available"
+            )
             return
 
         try:
             with _model_lock:
-                results = model(crop_bgr, verbose=False)
-        except Exception as exc:  # pragma: no cover - defensive
-            print(f"[object_detector] inference error on cam={self.cam_id}: {exc}")
+                detections = model.detect(crop_bgr)
+
+        except Exception as exc:
+            print(
+                f"[object_detector] inference error "
+                f"on cam={self.cam_id}: {exc}"
+            )
             return
 
-        detections_by_class = self._collect_allowed_detections(results, allowed_classes)
+        # ---------------------------------------------------------------
+        # Apply the application's per-camera/per-class filtering.
+        #
+        # ONNX detector returns:
+        #
+        #   (class_name, confidence, xyxy)
+        #
+        # We convert it into the same structure the rest of the
+        # object-detection pipeline expects.
+        # ---------------------------------------------------------------
 
-        # Normalize every box to full-frame 0.0-1.0 coordinates up
-        # front, before reconciliation -- both the fired events AND
-        # the persisted slot state (read by get_active_detections for
-        # the multi-box overlay) use this same ready-to-draw
-        # representation, so there's no separate offset math needed
-        # again later.
+        detections_by_class = {}
+
+        for class_name, conf, xyxy in detections:
+
+            if class_name not in allowed_classes:
+                continue
+
+            threshold = self.camera_store.get_class_confidence(
+                self.cam_id,
+                class_name,
+            )
+
+            if conf < threshold:
+                continue
+
+            detections_by_class.setdefault(
+                class_name,
+                [],
+            ).append(
+                (conf, xyxy)
+            )
+
+        # ---------------------------------------------------------------
+        # Normalize every box to full-frame 0.0-1.0 coordinates.
+        # ---------------------------------------------------------------
+
         ox, oy = offset
+
         normalized_by_class = {}
+
         for class_name, boxes in detections_by_class.items():
+
             normalized = []
+
             for conf, xyxy in boxes:
+
                 lx1, ly1, lx2, ly2 = xyxy
-                px1, py1, px2, py2 = ox + lx1, oy + ly1, ox + lx2, oy + ly2
+
+                px1 = ox + lx1
+                py1 = oy + ly1
+                px2 = ox + lx2
+                py2 = oy + ly2
+
                 bbox_norm = (
-                    max(0.0, min(1.0, px1 / frame_w)),
-                    max(0.0, min(1.0, py1 / frame_h)),
-                    max(0.0, min(1.0, px2 / frame_w)),
-                    max(0.0, min(1.0, py2 / frame_h)),
+                    max(
+                        0.0,
+                        min(1.0, px1 / frame_w),
+                    ),
+                    max(
+                        0.0,
+                        min(1.0, py1 / frame_h),
+                    ),
+                    max(
+                        0.0,
+                        min(1.0, px2 / frame_w),
+                    ),
+                    max(
+                        0.0,
+                        min(1.0, py2 / frame_h),
+                    ),
                 )
-                normalized.append((conf, bbox_norm))
+
+                normalized.append(
+                    (conf, bbox_norm)
+                )
+
             normalized_by_class[class_name] = normalized
 
-        # Reconcile every class that either has fresh boxes this tick
-        # OR already has tracked slots for this region -- the union,
-        # not just detected classes, so a class that just dropped to
-        # zero detections still gets a chance to age its slots out
-        # (see _reconcile_slots).
+        # ---------------------------------------------------------------
+        # Existing multi-instance presence tracking.
+        # ---------------------------------------------------------------
+
         with self._slots_lock:
-            existing_classes = {cls for (rk, cls) in self._slots.keys() if rk == region_key}
-        classes_to_reconcile = existing_classes | set(normalized_by_class.keys())
+            existing_classes = {
+                cls
+                for (rk, cls) in self._slots.keys()
+                if rk == region_key
+            }
+
+        classes_to_reconcile = (
+            existing_classes
+            | set(normalized_by_class.keys())
+        )
 
         now = time.time()
-        thumbnail = None  # encoded at most once per call, shared across every event it fires
+        thumbnail = None
 
         for class_name in classes_to_reconcile:
-            boxes = normalized_by_class.get(class_name, [])
-            fresh_events = self._reconcile_slots(region_key, class_name, boxes, now)
+
+            boxes = normalized_by_class.get(
+                class_name,
+                [],
+            )
+
+            fresh_events = self._reconcile_slots(
+                region_key,
+                class_name,
+                boxes,
+                now,
+            )
 
             for is_new, conf, bbox_norm in fresh_events:
+
                 if thumbnail is None:
                     thumbnail = _make_thumbnail(crop_bgr)
 
                 event = DetectionEvent(
                     camera_id=self.cam_id,
-                    camera_name=camera.get("name", self.cam_id),
-                    zone_id=zone["id"] if zone is not None else None,
-                    zone_name=zone.get("name") if zone is not None else None,
+                    camera_name=camera.get(
+                        "name",
+                        self.cam_id,
+                    ),
+                    zone_id=(
+                        zone["id"]
+                        if zone is not None
+                        else None
+                    ),
+                    zone_name=(
+                        zone.get("name")
+                        if zone is not None
+                        else None
+                    ),
                     class_name=class_name,
                     confidence=conf,
                     bbox=bbox_norm,
@@ -545,40 +951,11 @@ class ObjectDetectionWorker:
                     is_new=is_new,
                     timestamp=now,
                 )
+
                 if self.on_event is not None:
                     self.on_event(event)
-
-    def _collect_allowed_detections(self, results, allowed_classes):
-        """Returns {class_name: [(confidence, xyxy), ...]} for every
-        box in this inference call's results whose class is in
-        allowed_classes AND whose confidence clears that class's
-        camera-specific threshold (camera_store.get_class_confidence)
-        -- replaces the old _best_allowed_detection, which kept only
-        the single highest-confidence box across all classes combined
-        and discarded everything else."""
-        by_class = {}
-        for r in results:
-            boxes = getattr(r, "boxes", None)
-            if boxes is None:
-                continue
-            names = r.names
-            for box in boxes:
-                cls_idx = int(box.cls[0])
-                if isinstance(names, dict):
-                    class_name = names.get(cls_idx, str(cls_idx))
-                else:
-                    class_name = names[cls_idx] if cls_idx < len(names) else str(cls_idx)
-                if class_name not in allowed_classes:
-                    continue
-
-                conf = float(box.conf[0])
-                threshold = self.camera_store.get_class_confidence(self.cam_id, class_name)
-                if conf < threshold:
-                    continue
-
-                xyxy = tuple(box.xyxy[0].tolist())
-                by_class.setdefault(class_name, []).append((conf, xyxy))
-        return by_class
+                
+                
 
     def _reconcile_slots(self, region_key, class_name, boxes, now):
         """Updates the tracked presence slots for one (region, class)

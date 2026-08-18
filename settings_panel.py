@@ -2286,7 +2286,14 @@ class EventsSectionPanel(QWidget):
         type_label = f"Detected: {detection_class.capitalize()}" if detection_class else "Event"
         detail_bits = []
         if event["zone_id"]:
-            zone = self.app.store.get_zone(event["camera_id"], event["zone_id"])
+            # An event's camera may since have been deleted -- get_zone
+            # raises ValueError for an unknown camera, correct for live
+            # Settings UI flows but wrong here: an orphaned historical
+            # event is expected, not an error. Falls back to the raw
+            # zone id if the camera (or zone) no longer exists.
+            zone = None
+            if self.app.store.get_camera(event["camera_id"]) is not None:
+                zone = self.app.store.get_zone(event["camera_id"], event["zone_id"])
             detail_bits.append(f"Zone: {zone['name']}" if zone else f"Zone: {event['zone_id']}")
         else:
             detail_bits.append("Whole frame")

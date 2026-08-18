@@ -1,137 +1,277 @@
 """
-camera_store.py
+camera_store.py (SQLite edition)
 
-Handles saving/loading the list of configured cameras to a local JSON file
-so they persist between app launches.
+Drop-in replacement for the JSON-backed CameraStore. Same public API,
+same method signatures, same return shapes (get_camera/list_cameras
+still hand back a plain dict with nested "zones", "alert_rules",
+"object_detection_classes", "object_detection_class_confidence" lists/
+dicts) -- every other module (main.py, zone_editor.py, settings_panel.py,
+motion_detector.py, object_detector.py, alert_manager.py) reads camera
+dicts via those same keys, so nothing downstream needs to change.
 
-Each camera is a dict:
-{
-    "id": "cam_1",
-    "name": "Front Door",
-    "url": "rtsp://192.168.1.10:554/stream1",
-    "type": "rtsp",  # one of: rtsp, tcp, udp, http (informational only)
-    # Phase 3 motion detection settings -- both default-filled by
-    # get_camera()/list_cameras() callers reading via .get() with a
-    # fallback, the same missing-key-defaults-gracefully pattern used
-    # for "zones" below, so cameras created before Phase 3's tuning UI
-    # existed don't break.
-    "motion_enabled": True,        # master per-camera on/off switch
-    "motion_sensitivity": "medium",  # "low" | "medium" | "high"
-    # Phase 4 object detection settings -- same missing-key-defaults-
-    # gracefully pattern as everything else in this file.
-    "object_detection_enabled": False,   # master per-camera on/off switch (opt-in)
-    "object_detection_mode": "on_motion",  # "on_motion" | "continuous"
-    "object_detection_classes": ["person"],  # COCO class names to keep
-    # Multi-instance detection QoL addition: per-class confidence
-    # threshold, per camera -- e.g. this camera might want "person" at
-    # 70% (busy street, lots of false positives at lower confidence)
-    # but "car" at 40% (rarely wrong, want to catch more of them). A
-    # class with no entry here falls back to
-    # CameraStore.DEFAULT_CLASS_CONFIDENCE. Deliberately keyed by
-    # class name rather than living inside object_detection_classes
-    # itself (which stays a plain list) -- keeps the "which classes am
-    # I even looking for" question and the "how confident do I need to
-    # be about each one" question as two independent, separately-
-    # editable settings, matching how the Settings UI presents them
-    # (a checkbox plus an adjacent, independently-enabled spinbox).
-    "object_detection_class_confidence": {
-        "person": 0.7,
-    },
-    # Phase 5 alerting settings -- same missing-key-defaults-gracefully
-    # pattern as everything else in this file. Rules are per-camera
-    # (not per-zone -- see PROJECT_ROADMAP.md Phase 5 design notes).
-    "alert_rules": [
-        {
-            "id": "rule_1",
-            "name": "Night -- any motion",
-            "enabled": True,
-            "start": "22:00",   # HH:MM local time
-            "end": "06:00",     # end < start means the window crosses midnight
-            "trigger_type": "motion",       # "motion" | "object_class"
-            "classes": [],                  # only meaningful for "object_class"
-        },
-        ...
-    ],
-    "zones": [
-        {
-            "id": "zone_1",
-            "name": "Entrance",
-            # Polygon points normalized to 0.0-1.0 (fraction of frame
-            # width/height) so zones stay valid across resizes and
-            # resolution changes. At least 3 points to be a closed shape.
-            "points": [[0.1, 0.1], [0.4, 0.1], [0.4, 0.5], [0.1, 0.5]],
-            # Phase 3: per-zone opt-in for zone-restricted motion
-            # detection. False by default (opt-in, not opt-out) --
-            # drawing a zone is about defining a region of interest for
-            # many possible future uses, it shouldn't silently start
-            # gating motion detection the moment it's created.
-            "detection_enabled": False,
-        },
-        ...
-    ]
-}
+Why move off the flat JSON file: every single-field edit (toggling
+motion_enabled, tweaking one alert rule, nudging one zone point)
+previously rewrote the *entire* cameras.json, including every other
+camera's full zone/alert-rule/class-confidence data, on every save().
+That's fine at a handful of cameras but doesn't scale, and it's a
+classic torn-write risk if the app crashes mid-save (partial JSON =
+every camera's config lost, not just the one being edited). SQLite
+gives per-row updates and atomic commits instead.
 
-Cameras created before zones existed simply won't have a "zones" key --
-get_zones() treats a missing key the same as an empty list, so nothing
-breaks for old data.
+Storage boundary convention matches event_store.py: every other module
+calls CameraStore's methods and never touches the sqlite3 connection
+directly. Same per-call-connection threading model as event_store.py
+too -- MotionManager/ObjectDetectionManager/AlertManager workers all
+call into this concurrently from background threads, and sqlite3
+connections aren't safe to share across threads without either a lock
+or check_same_thread=False + WAL, so one connection per call is the
+simpler, cheap-enough-at-this-write-volume choice (config reads/writes
+are nowhere near a hot path like frame decode).
+
+Schema
+------
+cameras                  -- one row per camera, the scalar fields
+detection_classes        -- object_detection_classes list (camera_id, class_name)
+class_confidence         -- object_detection_class_confidence dict (camera_id, class_name, threshold)
+alert_rules               -- one row per alert rule
+alert_rule_classes        -- a rule's "classes" list (rule_id, class_name)
+zones                     -- one row per zone
+zone_points                -- a zone's polygon points, ordered by seq
+
+Insertion order (for list_cameras/get_zones/get_alert_rules) is
+preserved via each table's implicit rowid -- none of these tables use
+WITHOUT ROWID, so "ORDER BY rowid" reproduces the same order the JSON
+list/array order used to give for free.
 """
 
-import json
 import os
+import sqlite3
+import sys
+import threading
 import uuid
 
-DEFAULT_STORE_PATH = os.path.join(os.path.expanduser("~"), ".cctv_viewer_cameras.json")
+
+def _default_store_dir():
+    """Directory the exe/script is actually running from -- for a
+    PyInstaller onefile build, sys.executable is the exe's real path
+    (not the _MEIPASS temp extraction dir), so this keeps the DB next
+    to the exe regardless of the launch method. Same reasoning
+    event_store.py / recording_manager.py already use for their own
+    on-disk artifacts."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.abspath(".")
+
+
+DEFAULT_STORE_PATH = os.path.join(_default_store_dir(), "cctv_viewer_cameras.db")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cameras (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'rtsp',
+    motion_enabled INTEGER NOT NULL DEFAULT 1,
+    motion_sensitivity TEXT NOT NULL DEFAULT 'medium',
+    object_detection_enabled INTEGER NOT NULL DEFAULT 0,
+    object_detection_mode TEXT NOT NULL DEFAULT 'on_motion'
+);
+
+CREATE TABLE IF NOT EXISTS detection_classes (
+    camera_id TEXT NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+    class_name TEXT NOT NULL,
+    PRIMARY KEY (camera_id, class_name)
+);
+
+CREATE TABLE IF NOT EXISTS class_confidence (
+    camera_id TEXT NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+    class_name TEXT NOT NULL,
+    threshold REAL NOT NULL,
+    PRIMARY KEY (camera_id, class_name)
+);
+
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id TEXT PRIMARY KEY,
+    camera_id TEXT NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    start TEXT NOT NULL,
+    end TEXT NOT NULL,
+    trigger_type TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_rule_classes (
+    rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+    class_name TEXT NOT NULL,
+    PRIMARY KEY (rule_id, class_name)
+);
+
+CREATE TABLE IF NOT EXISTS zones (
+    id TEXT PRIMARY KEY,
+    camera_id TEXT NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    detection_enabled INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS zone_points (
+    zone_id TEXT NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    PRIMARY KEY (zone_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_rules_camera ON alert_rules(camera_id);
+CREATE INDEX IF NOT EXISTS idx_zones_camera ON zones(camera_id);
+"""
 
 
 class CameraStore:
-    # Matches object_detector.py's own historical default (the module
-    # constant that used to be the single global confidence gate
-    # before per-class thresholds existed) -- kept here too since this
-    # store needs its own fallback independent of that module (no
-    # import between them; object_detector.py depends on this store,
-    # not the other way around).
+    # Same fallback event_store's DEFAULT_CLASS_CONFIDENCE mirrors --
+    # kept as its own constant here too, no cross-module import.
     DEFAULT_CLASS_CONFIDENCE = 0.4
+
+    VALID_SENSITIVITIES = ("low", "medium", "high")
+    DEFAULT_SENSITIVITY = "medium"
+
+    VALID_DETECTION_MODES = ("on_motion", "continuous")
+    DEFAULT_DETECTION_MODE = "on_motion"
+    DEFAULT_DETECTION_CLASSES = ["person"]
+
+    VALID_TRIGGER_TYPES = ("motion", "object_class")
 
     def __init__(self, path=None):
         self.path = path or DEFAULT_STORE_PATH
-        self.cameras = []
-        self.load()
+        self._init_lock = threading.Lock()
+        self._ensure_schema()
 
-    def load(self):
-        """Load camera list from disk. If the file doesn't exist or is
-        corrupt, start with an empty list instead of crashing."""
-        if not os.path.exists(self.path):
-            self.cameras = []
-            return
+    # ----- connection / schema ------------------------------------
 
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                self.cameras = data
-            else:
-                self.cameras = []
-        except (json.JSONDecodeError, OSError):
-            # Corrupt or unreadable file -- don't crash the app, just
-            # start fresh. The bad file is left on disk in case the user
-            # wants to inspect it manually.
-            self.cameras = []
+    def _connect(self):
+        conn = sqlite3.connect(self.path, timeout=10)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
 
-    def save(self):
-        """Persist the current camera list to disk."""
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.cameras, f, indent=2)
+    def _ensure_schema(self):
+        with self._init_lock:
+            conn = self._connect()
+            try:
+                conn.executescript(_SCHEMA)
+                conn.commit()
+            finally:
+                conn.close()
+
+    # ----- internal: assembling the nested camera dict ---------------
+
+    def _row_to_camera(self, conn, row):
+        (cam_id, name, url, cam_type, motion_enabled, motion_sensitivity,
+         od_enabled, od_mode) = row
+
+        classes = [
+            r[0] for r in conn.execute(
+                "SELECT class_name FROM detection_classes WHERE camera_id = ? ORDER BY rowid",
+                (cam_id,),
+            ).fetchall()
+        ]
+        confidence = {
+            r[0]: r[1] for r in conn.execute(
+                "SELECT class_name, threshold FROM class_confidence WHERE camera_id = ?",
+                (cam_id,),
+            ).fetchall()
+        }
+
+        rules = []
+        for rule_row in conn.execute(
+            "SELECT id, name, enabled, start, end, trigger_type FROM alert_rules "
+            "WHERE camera_id = ? ORDER BY rowid",
+            (cam_id,),
+        ).fetchall():
+            rule_id = rule_row[0]
+            rule_classes = [
+                r[0] for r in conn.execute(
+                    "SELECT class_name FROM alert_rule_classes WHERE rule_id = ? ORDER BY rowid",
+                    (rule_id,),
+                ).fetchall()
+            ]
+            rules.append({
+                "id": rule_id,
+                "name": rule_row[1],
+                "enabled": bool(rule_row[2]),
+                "start": rule_row[3],
+                "end": rule_row[4],
+                "trigger_type": rule_row[5],
+                "classes": rule_classes,
+            })
+
+        zones = []
+        for zone_row in conn.execute(
+            "SELECT id, name, detection_enabled FROM zones WHERE camera_id = ? ORDER BY rowid",
+            (cam_id,),
+        ).fetchall():
+            zone_id = zone_row[0]
+            points = [
+                [r[0], r[1]] for r in conn.execute(
+                    "SELECT x, y FROM zone_points WHERE zone_id = ? ORDER BY seq",
+                    (zone_id,),
+                ).fetchall()
+            ]
+            zones.append({
+                "id": zone_id,
+                "name": zone_row[1],
+                "points": points,
+                "detection_enabled": bool(zone_row[2]),
+            })
+
+        return {
+            "id": cam_id,
+            "name": name,
+            "url": url,
+            "type": cam_type,
+            "motion_enabled": bool(motion_enabled),
+            "motion_sensitivity": motion_sensitivity,
+            "object_detection_enabled": bool(od_enabled),
+            "object_detection_mode": od_mode,
+            "object_detection_classes": classes,
+            "object_detection_class_confidence": confidence,
+            "alert_rules": rules,
+            "zones": zones,
+        }
+
+    def _fetch_camera_row(self, conn, cam_id):
+        return conn.execute(
+            "SELECT id, name, url, type, motion_enabled, motion_sensitivity, "
+            "object_detection_enabled, object_detection_mode FROM cameras WHERE id = ?",
+            (cam_id,),
+        ).fetchone()
+
+    def _require_camera_row(self, conn, cam_id):
+        row = self._fetch_camera_row(conn, cam_id)
+        if row is None:
+            raise ValueError(f"No camera found with id {cam_id}")
+        return row
+
+    # ----- camera CRUD -----------------------------------------------
 
     def list_cameras(self):
-        """Return a shallow copy so callers can't mutate internal state
-        without going through add/update/remove."""
-        return list(self.cameras)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, name, url, type, motion_enabled, motion_sensitivity, "
+                "object_detection_enabled, object_detection_mode FROM cameras ORDER BY rowid"
+            ).fetchall()
+            return [self._row_to_camera(conn, r) for r in rows]
+        finally:
+            conn.close()
 
     def get_camera(self, cam_id):
-        for cam in self.cameras:
-            if cam["id"] == cam_id:
-                return cam
-        return None
+        conn = self._connect()
+        try:
+            row = self._fetch_camera_row(conn, cam_id)
+            if row is None:
+                return None
+            return self._row_to_camera(conn, row)
+        finally:
+            conn.close()
 
     def add_camera(self, name, url, cam_type="rtsp"):
         name = (name or "").strip()
@@ -141,216 +281,232 @@ class CameraStore:
         if not url:
             raise ValueError("Camera URL cannot be empty.")
 
-        cam = {
-            "id": uuid.uuid4().hex[:8],
-            "name": name,
-            "url": url,
-            "type": cam_type,
-        }
-        self.cameras.append(cam)
-        self.save()
-        return cam
+        cam_id = uuid.uuid4().hex[:8]
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO cameras (id, name, url, type) VALUES (?, ?, ?, ?)",
+                (cam_id, name, url, cam_type),
+            )
+            for class_name in self.DEFAULT_DETECTION_CLASSES:
+                conn.execute(
+                    "INSERT INTO detection_classes (camera_id, class_name) VALUES (?, ?)",
+                    (cam_id, class_name),
+                )
+            conn.commit()
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))
+        finally:
+            conn.close()
 
     def update_camera(self, cam_id, name=None, url=None, cam_type=None):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
 
-        if name is not None:
-            name = name.strip()
-            if not name:
-                raise ValueError("Camera name cannot be empty.")
-            cam["name"] = name
+            if name is not None:
+                name = name.strip()
+                if not name:
+                    raise ValueError("Camera name cannot be empty.")
+                conn.execute("UPDATE cameras SET name = ? WHERE id = ?", (name, cam_id))
 
-        if url is not None:
-            url = url.strip()
-            if not url:
-                raise ValueError("Camera URL cannot be empty.")
-            cam["url"] = url
+            if url is not None:
+                url = url.strip()
+                if not url:
+                    raise ValueError("Camera URL cannot be empty.")
+                conn.execute("UPDATE cameras SET url = ? WHERE id = ?", (url, cam_id))
 
-        if cam_type is not None:
-            cam["type"] = cam_type
+            if cam_type is not None:
+                conn.execute("UPDATE cameras SET type = ? WHERE id = ?", (cam_type, cam_id))
 
-        self.save()
-        return cam
+            conn.commit()
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))
+        finally:
+            conn.close()
 
     def remove_camera(self, cam_id):
-        before = len(self.cameras)
-        self.cameras = [c for c in self.cameras if c["id"] != cam_id]
-        removed = len(self.cameras) != before
-        if removed:
-            self.save()
-        return removed
+        conn = self._connect()
+        try:
+            cur = conn.execute("DELETE FROM cameras WHERE id = ?", (cam_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
 
-    # ----- motion detection settings (Phase 3 tuning) -------------------
-    #
-    # Camera-level master switch + sensitivity. Defaults handled via
-    # .get() with a fallback wherever these are read, not by migrating
-    # old camera dicts on load -- same approach as "zones" already
-    # uses, so a camera saved before this feature existed just works.
-
-    VALID_SENSITIVITIES = ("low", "medium", "high")
-    DEFAULT_SENSITIVITY = "medium"
+    # ----- motion detection settings (Phase 3 tuning) -----------------
 
     def get_motion_enabled(self, cam_id):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        return cam.get("motion_enabled", True)
+        conn = self._connect()
+        try:
+            row = self._require_camera_row(conn, cam_id)
+            return bool(row[4])
+        finally:
+            conn.close()
 
     def set_motion_enabled(self, cam_id, enabled):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        cam["motion_enabled"] = bool(enabled)
-        self.save()
-        return cam
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            conn.execute(
+                "UPDATE cameras SET motion_enabled = ? WHERE id = ?",
+                (1 if enabled else 0, cam_id),
+            )
+            conn.commit()
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))
+        finally:
+            conn.close()
 
     def get_motion_sensitivity(self, cam_id):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        return cam.get("motion_sensitivity", self.DEFAULT_SENSITIVITY)
+        conn = self._connect()
+        try:
+            row = self._require_camera_row(conn, cam_id)
+            return row[5]
+        finally:
+            conn.close()
 
     def set_motion_sensitivity(self, cam_id, sensitivity):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
         if sensitivity not in self.VALID_SENSITIVITIES:
             raise ValueError(
                 f"Sensitivity must be one of {self.VALID_SENSITIVITIES}, got {sensitivity!r}"
             )
-        cam["motion_sensitivity"] = sensitivity
-        self.save()
-        return cam
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            conn.execute(
+                "UPDATE cameras SET motion_sensitivity = ? WHERE id = ?", (sensitivity, cam_id)
+            )
+            conn.commit()
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))
+        finally:
+            conn.close()
 
-    # ----- object detection settings (Phase 4 tuning) --------------------
-    #
-    # Camera-level master switch + trigger mode + class allowlist.
-    # Same missing-key-defaults-gracefully pattern as motion settings
-    # above -- a camera saved before Phase 4 existed just works, opting
-    # in to detection (False) with sane defaults for mode/classes.
-
-    VALID_DETECTION_MODES = ("on_motion", "continuous")
-    DEFAULT_DETECTION_MODE = "on_motion"
-    DEFAULT_DETECTION_CLASSES = ["person"]
+    # ----- object detection settings (Phase 4 tuning) ------------------
 
     def get_object_detection_enabled(self, cam_id):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        return cam.get("object_detection_enabled", False)
+        conn = self._connect()
+        try:
+            row = self._require_camera_row(conn, cam_id)
+            return bool(row[6])
+        finally:
+            conn.close()
 
     def set_object_detection_enabled(self, cam_id, enabled):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        cam["object_detection_enabled"] = bool(enabled)
-        self.save()
-        return cam
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            conn.execute(
+                "UPDATE cameras SET object_detection_enabled = ? WHERE id = ?",
+                (1 if enabled else 0, cam_id),
+            )
+            conn.commit()
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))
+        finally:
+            conn.close()
 
     def get_object_detection_mode(self, cam_id):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        return cam.get("object_detection_mode", self.DEFAULT_DETECTION_MODE)
+        conn = self._connect()
+        try:
+            row = self._require_camera_row(conn, cam_id)
+            return row[7]
+        finally:
+            conn.close()
 
     def set_object_detection_mode(self, cam_id, mode):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
         if mode not in self.VALID_DETECTION_MODES:
-            raise ValueError(
-                f"Mode must be one of {self.VALID_DETECTION_MODES}, got {mode!r}"
-            )
-        cam["object_detection_mode"] = mode
-        self.save()
-        return cam
+            raise ValueError(f"Mode must be one of {self.VALID_DETECTION_MODES}, got {mode!r}")
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            conn.execute("UPDATE cameras SET object_detection_mode = ? WHERE id = ?", (mode, cam_id))
+            conn.commit()
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))
+        finally:
+            conn.close()
 
     def get_object_detection_classes(self, cam_id):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        return list(cam.get("object_detection_classes", self.DEFAULT_DETECTION_CLASSES))
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            return [
+                r[0] for r in conn.execute(
+                    "SELECT class_name FROM detection_classes WHERE camera_id = ? ORDER BY rowid",
+                    (cam_id,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
 
     def set_object_detection_classes(self, cam_id, classes):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
         cleaned = [str(c).strip() for c in (classes or []) if str(c).strip()]
-        cam["object_detection_classes"] = cleaned
-        self.save()
-        return cam
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            conn.execute("DELETE FROM detection_classes WHERE camera_id = ?", (cam_id,))
+            for class_name in cleaned:
+                conn.execute(
+                    "INSERT INTO detection_classes (camera_id, class_name) VALUES (?, ?)",
+                    (cam_id, class_name),
+                )
+            conn.commit()
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))
+        finally:
+            conn.close()
 
     # ----- per-class confidence thresholds (multi-instance QoL) --------
-    #
-    # A class's confidence gate is per-camera, not global -- the same
-    # class might need a stricter threshold on one camera (busy scene,
-    # more false positives) than another. Defaults-gracefully to
-    # DEFAULT_CLASS_CONFIDENCE for any class without an explicit entry,
-    # same pattern as every other per-camera setting in this file.
 
     def get_class_confidence_thresholds(self, cam_id):
-        """Return a shallow copy of this camera's {class_name:
-        threshold} overrides (not filled in for every candidate class
-        -- only classes the user has actually adjusted away from the
-        default appear here). Use get_class_confidence() for a single
-        class's effective threshold including the fallback."""
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        return dict(cam.get("object_detection_class_confidence", {}))
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            return {
+                r[0]: r[1] for r in conn.execute(
+                    "SELECT class_name, threshold FROM class_confidence WHERE camera_id = ?",
+                    (cam_id,),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
 
     def get_class_confidence(self, cam_id, class_name):
-        """This camera's effective confidence threshold for one class
-        -- its explicit override if set, else DEFAULT_CLASS_CONFIDENCE.
-        This is what object_detector.py actually calls per detected
-        box, once per inference call."""
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        overrides = cam.get("object_detection_class_confidence", {})
-        return float(overrides.get(class_name, self.DEFAULT_CLASS_CONFIDENCE))
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            row = conn.execute(
+                "SELECT threshold FROM class_confidence WHERE camera_id = ? AND class_name = ?",
+                (cam_id, class_name),
+            ).fetchone()
+            return float(row[0]) if row is not None else self.DEFAULT_CLASS_CONFIDENCE
+        finally:
+            conn.close()
 
     def set_class_confidence_threshold(self, cam_id, class_name, threshold):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
         threshold = float(threshold)
         if not (0.0 <= threshold <= 1.0):
             raise ValueError(f"Confidence threshold must be between 0.0 and 1.0, got {threshold!r}")
-        cam.setdefault("object_detection_class_confidence", {})[class_name] = threshold
-        self.save()
-        return cam
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            conn.execute(
+                "INSERT INTO class_confidence (camera_id, class_name, threshold) VALUES (?, ?, ?) "
+                "ON CONFLICT(camera_id, class_name) DO UPDATE SET threshold = excluded.threshold",
+                (cam_id, class_name, threshold),
+            )
+            conn.commit()
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))
+        finally:
+            conn.close()
 
-    # ----- alert rules (Phase 5) ----------------------------------------
-    #
-    # Per-camera list of time-of-day alert rules. Deliberately NOT
-    # per-zone (kept simple per the Phase 5 design discussion) -- a
-    # rule matches either "any motion on this camera" (whole-frame OR
-    # any zone -- see alert_matcher.py's note on why both must be
-    # checked) or "this object class was seen," within a time window.
-    #
-    # can_use_object_class_trigger() is the same single-chokepoint
-    # pattern as can_add_zone() above: a future tier system (motion
-    # alerts on every tier, object-class alerts gated to a paid tier)
-    # only needs to change this one method, plus whatever UI wants to
-    # proactively disable that option ahead of time. Always True today
-    # -- no tiers exist yet.
-
-    VALID_TRIGGER_TYPES = ("motion", "object_class")
+    # ----- alert rules (Phase 5) ---------------------------------------
 
     def can_use_object_class_trigger(self, cam_id):
         return True
 
     def get_alert_rules(self, cam_id):
-        """Return a shallow copy of the alert rule list for a camera
-        (empty list if none yet, including cameras saved before
-        alerting existed)."""
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        return list(cam.get("alert_rules", []))
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))["alert_rules"]
+        finally:
+            conn.close()
 
     def get_alert_rule(self, cam_id, rule_id):
         for rule in self.get_alert_rules(cam_id):
@@ -373,14 +529,9 @@ class CameraStore:
         return f"{h:02d}:{m:02d}"
 
     def add_alert_rule(self, cam_id, name, start, end, trigger_type, classes=None, enabled=True):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-
         name = (name or "").strip()
         if not name:
             raise ValueError("Rule name cannot be empty.")
-
         if trigger_type not in self.VALID_TRIGGER_TYPES:
             raise ValueError(
                 f"trigger_type must be one of {self.VALID_TRIGGER_TYPES}, got {trigger_type!r}"
@@ -390,86 +541,107 @@ class CameraStore:
 
         start = self._validate_hhmm(start, "Start time")
         end = self._validate_hhmm(end, "End time")
-
         cleaned_classes = [str(c).strip() for c in (classes or []) if str(c).strip()]
 
-        rule = {
-            "id": uuid.uuid4().hex[:8],
-            "name": name,
-            "enabled": bool(enabled),
-            "start": start,
-            "end": end,
-            "trigger_type": trigger_type,
-            "classes": cleaned_classes,
-        }
-        cam.setdefault("alert_rules", []).append(rule)
-        self.save()
-        return rule
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            rule_id = uuid.uuid4().hex[:8]
+            conn.execute(
+                "INSERT INTO alert_rules (id, camera_id, name, enabled, start, end, trigger_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (rule_id, cam_id, name, 1 if enabled else 0, start, end, trigger_type),
+            )
+            for class_name in cleaned_classes:
+                conn.execute(
+                    "INSERT INTO alert_rule_classes (rule_id, class_name) VALUES (?, ?)",
+                    (rule_id, class_name),
+                )
+            conn.commit()
+            return self.get_alert_rule(cam_id, rule_id)
+        finally:
+            conn.close()
 
     def update_alert_rule(self, cam_id, rule_id, name=None, start=None, end=None,
                            trigger_type=None, classes=None, enabled=None):
-        rule = self.get_alert_rule(cam_id, rule_id)
-        if rule is None:
-            raise ValueError(f"No alert rule found with id {rule_id}")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM alert_rules WHERE id = ? AND camera_id = ?", (rule_id, cam_id)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"No alert rule found with id {rule_id}")
 
-        if name is not None:
-            name = name.strip()
-            if not name:
-                raise ValueError("Rule name cannot be empty.")
-            rule["name"] = name
+            if name is not None:
+                name = name.strip()
+                if not name:
+                    raise ValueError("Rule name cannot be empty.")
+                conn.execute("UPDATE alert_rules SET name = ? WHERE id = ?", (name, rule_id))
 
-        if trigger_type is not None:
-            if trigger_type not in self.VALID_TRIGGER_TYPES:
-                raise ValueError(
-                    f"trigger_type must be one of {self.VALID_TRIGGER_TYPES}, got {trigger_type!r}"
+            if trigger_type is not None:
+                if trigger_type not in self.VALID_TRIGGER_TYPES:
+                    raise ValueError(
+                        f"trigger_type must be one of {self.VALID_TRIGGER_TYPES}, got {trigger_type!r}"
+                    )
+                if trigger_type == "object_class" and not self.can_use_object_class_trigger(cam_id):
+                    raise ValueError("Object-class alert triggers aren't available for this camera.")
+                conn.execute(
+                    "UPDATE alert_rules SET trigger_type = ? WHERE id = ?", (trigger_type, rule_id)
                 )
-            if trigger_type == "object_class" and not self.can_use_object_class_trigger(cam_id):
-                raise ValueError("Object-class alert triggers aren't available for this camera.")
-            rule["trigger_type"] = trigger_type
 
-        if start is not None:
-            rule["start"] = self._validate_hhmm(start, "Start time")
-        if end is not None:
-            rule["end"] = self._validate_hhmm(end, "End time")
+            if start is not None:
+                conn.execute(
+                    "UPDATE alert_rules SET start = ? WHERE id = ?",
+                    (self._validate_hhmm(start, "Start time"), rule_id),
+                )
+            if end is not None:
+                conn.execute(
+                    "UPDATE alert_rules SET end = ? WHERE id = ?",
+                    (self._validate_hhmm(end, "End time"), rule_id),
+                )
 
-        if classes is not None:
-            rule["classes"] = [str(c).strip() for c in classes if str(c).strip()]
+            if classes is not None:
+                conn.execute("DELETE FROM alert_rule_classes WHERE rule_id = ?", (rule_id,))
+                for class_name in classes:
+                    class_name = str(class_name).strip()
+                    if class_name:
+                        conn.execute(
+                            "INSERT INTO alert_rule_classes (rule_id, class_name) VALUES (?, ?)",
+                            (rule_id, class_name),
+                        )
 
-        if enabled is not None:
-            rule["enabled"] = bool(enabled)
+            if enabled is not None:
+                conn.execute(
+                    "UPDATE alert_rules SET enabled = ? WHERE id = ?",
+                    (1 if enabled else 0, rule_id),
+                )
 
-        self.save()
-        return rule
+            conn.commit()
+            return self.get_alert_rule(cam_id, rule_id)
+        finally:
+            conn.close()
 
     def remove_alert_rule(self, cam_id, rule_id):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            cur = conn.execute(
+                "DELETE FROM alert_rules WHERE id = ? AND camera_id = ?", (rule_id, cam_id)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
 
-        rules = cam.get("alert_rules", [])
-        before = len(rules)
-        cam["alert_rules"] = [r for r in rules if r["id"] != rule_id]
-        removed = len(cam["alert_rules"]) != before
-        if removed:
-            self.save()
-        return removed
-
-    # ----- zones ------------------------------------------------------
-    #
-    # All zone creation funnels through add_zone(), which itself funnels
-    # through can_add_zone(). That's deliberate: it's the one place a
-    # future tier/plan limit ("free tier = 2 zones per camera") gets
-    # enforced, instead of needing to be checked in every UI path that
-    # might create a zone. For now can_add_zone() always allows it.
+    # ----- zones --------------------------------------------------------
 
     def get_zones(self, cam_id):
-        """Return a shallow copy of the zone list for a camera (empty
-        list if the camera has none yet, including cameras saved before
-        zones existed)."""
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-        return list(cam.get("zones", []))
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            return self._row_to_camera(conn, self._fetch_camera_row(conn, cam_id))["zones"]
+        finally:
+            conn.close()
 
     def get_zone(self, cam_id, zone_id):
         for zone in self.get_zones(cam_id):
@@ -478,83 +650,90 @@ class CameraStore:
         return None
 
     def can_add_zone(self, cam_id):
-        """Hook for future plan/tier enforcement (e.g. 'free tier allows
-        2 zones per camera'). Always True for now -- no limits exist
-        yet. Centralizing the check here means a future limit only
-        needs to change this one method, plus whatever UI wants to
-        proactively disable the "add zone" action ahead of time."""
+        """Same future tier-limit hook as the JSON version -- always
+        True today, centralized here for a later plan/limit check."""
         return True
 
-    def add_zone(self, cam_id, name, points):
-        """Add a polygon zone to a camera.
-
-        points: list of (x, y) pairs, normalized 0.0-1.0, in the order
-        the user drew them. Needs at least 3 points to form a polygon.
-        """
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-
-        if not self.can_add_zone(cam_id):
-            raise ValueError("Zone limit reached for this camera.")
-
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("Zone name cannot be empty.")
-
-        points = [[float(x), float(y)] for x, y in points]
+    @staticmethod
+    def _validate_points(points):
+        points = [(float(x), float(y)) for x, y in points]
         if len(points) < 3:
             raise ValueError("A zone needs at least 3 points.")
         for x, y in points:
             if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
                 raise ValueError("Zone points must be normalized between 0.0 and 1.0.")
+        return points
 
-        zone = {
-            "id": uuid.uuid4().hex[:8],
-            "name": name,
-            "points": points,
-            # Opt-in, off by default -- see module docstring.
-            "detection_enabled": False,
-        }
-        cam.setdefault("zones", []).append(zone)
-        self.save()
-        return zone
+    def add_zone(self, cam_id, name, points):
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("Zone name cannot be empty.")
+        points = self._validate_points(points)
+
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            if not self.can_add_zone(cam_id):
+                raise ValueError("Zone limit reached for this camera.")
+
+            zone_id = uuid.uuid4().hex[:8]
+            conn.execute(
+                "INSERT INTO zones (id, camera_id, name, detection_enabled) VALUES (?, ?, ?, 0)",
+                (zone_id, cam_id, name),
+            )
+            for seq, (x, y) in enumerate(points):
+                conn.execute(
+                    "INSERT INTO zone_points (zone_id, seq, x, y) VALUES (?, ?, ?, ?)",
+                    (zone_id, seq, x, y),
+                )
+            conn.commit()
+            return self.get_zone(cam_id, zone_id)
+        finally:
+            conn.close()
 
     def update_zone(self, cam_id, zone_id, name=None, points=None, detection_enabled=None):
-        zone = self.get_zone(cam_id, zone_id)
-        if zone is None:
-            raise ValueError(f"No zone found with id {zone_id}")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM zones WHERE id = ? AND camera_id = ?", (zone_id, cam_id)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"No zone found with id {zone_id}")
 
-        if name is not None:
-            name = name.strip()
-            if not name:
-                raise ValueError("Zone name cannot be empty.")
-            zone["name"] = name
+            if name is not None:
+                name = name.strip()
+                if not name:
+                    raise ValueError("Zone name cannot be empty.")
+                conn.execute("UPDATE zones SET name = ? WHERE id = ?", (name, zone_id))
 
-        if points is not None:
-            points = [[float(x), float(y)] for x, y in points]
-            if len(points) < 3:
-                raise ValueError("A zone needs at least 3 points.")
-            for x, y in points:
-                if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
-                    raise ValueError("Zone points must be normalized between 0.0 and 1.0.")
-            zone["points"] = points
+            if points is not None:
+                validated = self._validate_points(points)
+                conn.execute("DELETE FROM zone_points WHERE zone_id = ?", (zone_id,))
+                for seq, (x, y) in enumerate(validated):
+                    conn.execute(
+                        "INSERT INTO zone_points (zone_id, seq, x, y) VALUES (?, ?, ?, ?)",
+                        (zone_id, seq, x, y),
+                    )
 
-        if detection_enabled is not None:
-            zone["detection_enabled"] = bool(detection_enabled)
+            if detection_enabled is not None:
+                conn.execute(
+                    "UPDATE zones SET detection_enabled = ? WHERE id = ?",
+                    (1 if detection_enabled else 0, zone_id),
+                )
 
-        self.save()
-        return zone
+            conn.commit()
+            return self.get_zone(cam_id, zone_id)
+        finally:
+            conn.close()
 
     def remove_zone(self, cam_id, zone_id):
-        cam = self.get_camera(cam_id)
-        if cam is None:
-            raise ValueError(f"No camera found with id {cam_id}")
-
-        zones = cam.get("zones", [])
-        before = len(zones)
-        cam["zones"] = [z for z in zones if z["id"] != zone_id]
-        removed = len(cam["zones"]) != before
-        if removed:
-            self.save()
-        return removed
+        conn = self._connect()
+        try:
+            self._require_camera_row(conn, cam_id)
+            cur = conn.execute(
+                "DELETE FROM zones WHERE id = ? AND camera_id = ?", (zone_id, cam_id)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()

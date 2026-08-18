@@ -57,7 +57,19 @@ from event_store import EventStore
 # bug, not better. Anchoring to this file's own location means the
 # footage folder always lands next to camera_store.py/main.py/etc.
 # regardless of launch directory.
-_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+import sys
+
+def _project_dir():
+    """Directory the exe/script actually lives in -- for a PyInstaller
+    onefile build, sys.executable is the real exe location (not the
+    temporary _MEIPASS extraction folder __file__ would resolve to),
+    so footage/thumbnails persist next to the exe across runs instead
+    of vanishing when the temp extraction folder is cleaned up."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+_PROJECT_DIR = _project_dir()
 FOOTAGE_ROOT = os.path.join(_PROJECT_DIR, "cctv_viewer_footage")
 
 SEGMENT_DURATION_SECONDS = 30 * 60  # 30 minutes, fixed -- see Phase 7 design discussion
