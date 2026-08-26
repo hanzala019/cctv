@@ -374,15 +374,20 @@ class MainWindow(QMainWindow):
 
         tile = self.grid_view.tiles.get(cam_id)
         if tile is not None:
+            tile.camera = cam
             tile.set_zones(cam.get("zones", []))
 
-        if (
-            self.single_view.camera
-            and self.single_view.camera["id"] == cam_id
-            and not self.single_view.zone_editing
-            and self.single_view.tile is not None
-        ):
-            self.single_view.tile.set_zones(cam.get("zones", []))
+        if self.single_view.camera and self.single_view.camera["id"] == cam_id:
+            # CameraStore returns a NEW dict on every call -- it does not
+            # mutate in place, as it did when the store was JSON-backed.
+            # Without this reassignment, _rebuild_body() builds the next
+            # CameraTile from the snapshot taken when the view was opened,
+            # so every zone edit stays invisible until the view is rebuilt
+            # (i.e. until you go back to the grid).
+            self.single_view.camera = cam
+
+            if not self.single_view.zone_editing and self.single_view.tile is not None:
+                self.single_view.tile.set_zones(cam.get("zones", []))
 
         # If the Zones settings section is open on this same camera,
         # refresh its zone list + canvas too -- e.g. a zone drawn or

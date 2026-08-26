@@ -105,23 +105,56 @@ class ResourceMonitor:
         self._last, self._last_wall = current, now_wall
         return out
 
+    #: Thread groups that aren't a camera. Kept explicit so a real
+    #: camera id can never be silently swallowed into one of them.
+    APP_GROUP = "_app"        # Qt main thread and other named Python threads
+    NATIVE_GROUP = "_native"  # threads Python didn't create
+
     def cpu_by_camera(self):
         """Rolls the per-thread sample up per camera.
 
-        Returns {cam_id: {"total": pct, "workers": {subsystem: pct}}}.
-        Relies on the "{LOG_TAG}-{cam_id}" naming; threads that don't
-        match are grouped under "_other".
+        Returns {group: {"total": pct, "workers": {label: pct},
+                         "threads": count}}.
+
+        Three kinds of thread end up here:
+
+          * Workers, named "{LOG_TAG}-{cam_id}" by BackgroundWorker.
+            These group under their camera id -- the useful rows.
+
+          * Other Python threads (the Qt main thread). Grouped under
+            _app. On a GUI app the main thread is often the single
+            biggest consumer, so it gets its own row rather than being
+            mixed into a camera's total.
+
+          * Threads Python never created: FFmpeg's decoder pool,
+            onnxruntime's intra-op pool, Qt internals. There are
+            typically dozens, they have no names, and nothing can
+            attribute them to a camera -- so they are summed into one
+            _native row with a thread count, instead of printing ~40
+            meaningless id rows.
         """
-        by_cam = {}
-        for name, pct in self.sample_cpu().items():
-            if "-" in name:
-                subsystem, cam_id = name.rsplit("-", 1)
-            else:
-                subsystem, cam_id = name, "_other"
-            entry = by_cam.setdefault(cam_id, {"total": 0.0, "workers": {}})
+        by_group = {}
+
+        def add(group, label, pct):
+            entry = by_group.setdefault(
+                group, {"total": 0.0, "workers": {}, "threads": 0}
+            )
             entry["total"] += pct
-            entry["workers"][subsystem] = entry["workers"].get(subsystem, 0.0) + pct
-        return by_cam
+            entry["threads"] += 1
+            if label is not None:
+                entry["workers"][label] = entry["workers"].get(label, 0.0) + pct
+
+        for name, pct in self.sample_cpu().items():
+            if name.startswith("tid-"):
+                # Unnamed OS thread: native library, not ours.
+                add(self.NATIVE_GROUP, None, pct)
+            elif "-" in name:
+                subsystem, cam_id = name.rsplit("-", 1)
+                add(cam_id, subsystem, pct)
+            else:
+                add(self.APP_GROUP, name, pct)
+
+        return by_group
 
     # ----- process-wide ------------------------------------------------
 
@@ -151,16 +184,23 @@ class ResourceMonitor:
         if not cpu:
             lines.append("cpu: (first sample -- call again for a delta)")
         else:
-            lines.append("cpu (% of one core, since last sample):")
-            for cam_id, entry in sorted(
-                cpu.items(), key=lambda kv: -kv[1]["total"]
-            ):
-                workers = ", ".join(
-                    f"{k}={v:.1f}"
-                    for k, v in sorted(entry["workers"].items(), key=lambda kv: -kv[1])
-                    if v >= 0.05
-                )
-                lines.append(f"  {cam_id:<12} {entry['total']:6.1f}%   {workers}")
+            total = sum(e["total"] for e in cpu.values())
+            lines.append(f"cpu: {total:.1f}% of one core total, since last sample")
+            for group, entry in sorted(cpu.items(), key=lambda kv: -kv[1]["total"]):
+                if group == self.NATIVE_GROUP:
+                    detail = (
+                        f"{entry['threads']} unnamed threads "
+                        f"(ffmpeg decode, onnxruntime, Qt) -- not attributable"
+                    )
+                else:
+                    detail = ", ".join(
+                        f"{k}={v:.1f}"
+                        for k, v in sorted(
+                            entry["workers"].items(), key=lambda kv: -kv[1]
+                        )
+                        if v >= 0.05
+                    )
+                lines.append(f"  {group:<12} {entry['total']:6.1f}%   {detail}")
 
         if managers:
             mem = per_camera_memory(managers)
@@ -270,7 +310,3 @@ def _nvidia_smi():
         return ""
     util, used, total = (x.strip() for x in out.splitlines()[0].split(","))
     return f"{util}% util, {used}/{total} MB"
-
-
-# monitor = ResourceMonitor()
-# print(monitor.report(managers={"stream": streams, "motion": motion, ...}))

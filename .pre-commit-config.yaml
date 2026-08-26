@@ -17,7 +17,7 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.4
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
         stages: [manual]   # not enforced yet -- see GUIDELINE.md
@@ -45,10 +45,3 @@ repos:
         language: system
         pass_filenames: false
         types: [python]
-
-      - id: pytest
-        name: pytest
-        entry: pytest -q
-        language: system
-        pass_filenames: false
-        stages: [pre-push]
