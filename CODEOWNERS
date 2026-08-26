@@ -1,0 +1,20 @@
+# Auto-request review from whoever owns each area.
+# Replace the placeholders with real GitHub handles.
+
+# Storage schema is the contract everyone depends on -- always reviewed.
+/cctv/storage/          @storage-owner
+/cctv/core/             @storage-owner
+
+/cctv/capture/          @pipeline-owner
+/cctv/detection/        @pipeline-owner
+/cctv/recording/        @pipeline-owner
+/cctv/alerts/           @alerts-owner
+
+/cctv/ui/widgets/       @ui-owner
+/cctv/ui/views/         @ui-owner
+/cctv/ui/settings/      @ui-owner
+/cctv/ui/theme.py       @ui-owner
+
+# Wiring hub -- highest conflict risk, keep changes small.
+/cctv/ui/app.py         @ui-owner @pipeline-owner
+/main.py                @ui-owner @pipeline-owner

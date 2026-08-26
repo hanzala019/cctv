@@ -1,20 +1,39 @@
-@"
+# --- Runtime data ------------------------------------------------------
+# Everything the app writes lives under data/ (see cctv/paths.py).
+# Recording writes tens of GB per camera per day -- never commit any of it.
+/data/
+
+# Legacy locations, from before paths.py unified them. Listed explicitly
+# so an old checkout doesn't commit a stray database. Do NOT replace
+# these with a blanket *.db rule: a global ignore would also hide a
+# database accidentally created *inside* the package tree by a path
+# regression, which is exactly what CI's clean-tree check exists to catch.
+/cctv_viewer_cameras.db
+/cctv_viewer_footage/
+/event_thumbnails/
+
+# --- Model weights -----------------------------------------------------
+# Downloaded, not committed. See README.md, "Get the detection model".
+/models/*.onnx
+/models/*.pt
+
+# --- Python ------------------------------------------------------------
 __pycache__/
-*.pyc
-
+*.py[cod]
+*.egg-info/
+.venv/
 venv/
-venv-app/
 
-build/
-dist/
-installer_output/
+# --- Tooling caches ----------------------------------------------------
+# CI asserts the working tree is clean after a test run; without these
+# the run fails on its own cache directories.
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
 
-*.db
-cctv_viewer_cameras.json
-
-cctv_viewer_footage/
-event_thumbnails/
-
-*.pt
-*.onnx
-"@ | Out-File -Encoding utf8 .gitignore
+# --- Editors and OS ----------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

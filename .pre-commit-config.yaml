@@ -1,0 +1,54 @@
+# Local guard rails. CI is the source of truth, but these catch the
+# common mistakes before you push, so you don't wait 3 minutes to learn
+# you forgot to sort an import.
+#
+# Install once, per clone:
+#     pip install pre-commit
+#     pre-commit install --hook-type pre-commit --hook-type pre-push
+#
+# NOTE: the `rev:` pins below were not verifiable at time of writing
+# (GitHub API rate limit). Run `pre-commit autoupdate` once after
+# installing -- it rewrites them to the real latest tags.
+#
+# The lint hooks run on every commit (fast). The test suite runs only on
+# push (slower), so committing stays snappy.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+        stages: [manual]   # not enforced yet -- see GUIDELINE.md
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        # Footage and model weights must never be committed. 2 MB is
+        # comfortably above any source file and well below a single
+        # video segment or an .onnx model.
+        args: [--maxkb=2048]
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: local
+    hooks:
+      - id: check-imports
+        name: import cycles and layering
+        entry: python scripts/check_imports.py
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: pytest
+        name: pytest
+        entry: pytest -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

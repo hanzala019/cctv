@@ -1,0 +1,10 @@
+# Development dependencies. Install with:
+#   pip install -r requirements-dev.txt
+#
+# This includes requirements.txt, so you only need this one locally.
+
+-r requirements.txt
+
+pytest==9.1.1
+pytest-cov==7.1.0
+ruff==0.16.4

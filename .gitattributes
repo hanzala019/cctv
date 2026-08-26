@@ -1,0 +1,5 @@
+# The old flat files were committed with CRLF. Normalise so people on
+# Windows and Linux stop producing whole-file diffs on every save.
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
