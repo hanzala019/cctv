@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, rework]
   pull_request:
 
 # A new push to the same branch cancels the previous run rather than

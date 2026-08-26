@@ -26,6 +26,7 @@ cctv/
 │   └── event_logger.py
 └── ui/
     ├── app.py              MainWindow -- the wiring hub
+    ├── diagnostics.py
     ├── theme.py
     ├── widgets/            reusable, no app knowledge
     │   ├── video_label.py  painting + overlays

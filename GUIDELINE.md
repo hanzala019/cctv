@@ -48,6 +48,7 @@ cctv/
 ├── recording/              segment writing + event logging
 └── ui/
     ├── app.py              MainWindow — the wiring hub
+    ├── diagnostics.py      Logs cpu, memory and gpu usages
     ├── theme.py            colours and shared stylesheets
     ├── widgets/            reusable, no app knowledge
     ├── views/              full screens
