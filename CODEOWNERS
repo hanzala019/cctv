@@ -10,11 +10,11 @@
 /core/recording/        @pipeline-owner
 /core/alerts/           @alerts-owner
 
-/core/ui/widgets/       @ui-owner
-/core/ui/views/         @ui-owner
-/core/ui/settings/      @ui-owner
-/core/ui/theme.py       @ui-owner
+/core/ui/widgets/       @trulyfalse
+/core/ui/views/         @trulyfalse
+/core/ui/settings/      @trulyfalse
+/core/ui/theme.py       @trulyfalse
 
 # Wiring hub -- highest conflict risk, keep changes small.
-/core/ui/app.py         @ui-owner @pipeline-owner
-/main.py                @ui-owner @pipeline-owner
+/core/ui/app.py         @trulyfalse @hanzala019 @adnanjami
+/main.py                @trulyfalse @hanzala019 @adnanjami
