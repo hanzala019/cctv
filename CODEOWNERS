@@ -2,13 +2,13 @@
 # Replace the placeholders with real GitHub handles.
 
 # Storage schema is the contract everyone depends on -- always reviewed.
-/core/storage/          @storage-owner
-/core/worker/             @storage-owner
+/core/storage/          @adnanjami @hanzala019
+/core/worker/           @adnanjami @hanzala019
 
-/core/capture/          @pipeline-owner
-/core/detection/        @pipeline-owner
-/core/recording/        @pipeline-owner
-/core/alerts/           @alerts-owner
+/core/capture/          @hanzala019 @adnanjami
+/core/detection/        @hanzala019 @adnanjami
+/core/recording/        @hanzala019 @adnanjami
+/core/alerts/           @hanzala019 @adnanjami
 
 /core/ui/widgets/       @trulyfalse
 /core/ui/views/         @trulyfalse
