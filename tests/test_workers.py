@@ -152,6 +152,11 @@ class FakeRecordingManager:
     def get_current_segment_id(self, cam_id):
         return "seg1"
 
+class FakeSettingsStore:
+    def get_recording_path(self):
+        return None
+    def get_settings_info(self):
+        return {"duration_minutes": 30.0, "retention_days": 14}
 
 class FakeEventStore:
     """Records calls so tests can assert on what a worker wrote."""
@@ -767,6 +772,7 @@ def test_stream_both_open_attempts_get_timeout_params(monkeypatch):
         params = args[1]
         assert _cv2.CAP_PROP_OPEN_TIMEOUT_MSEC in params, f"attempt {i + 1}"
         assert _cv2.CAP_PROP_READ_TIMEOUT_MSEC in params, f"attempt {i + 1}"
+
 
 
 def test_stream_corruption_thumbnail_is_cached(video_file):
