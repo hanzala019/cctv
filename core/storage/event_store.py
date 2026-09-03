@@ -117,6 +117,8 @@ CREATE TABLE IF NOT EXISTS events (
     pushed_to_cloud INTEGER DEFAULT 0
 );
 
+
+
 CREATE INDEX IF NOT EXISTS idx_segments_camera_time ON segments(camera_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_events_camera_time ON events(camera_id, detected_at);
 CREATE INDEX IF NOT EXISTS idx_events_segment ON events(segment_id);

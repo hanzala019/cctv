@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS cameras (
     motion_enabled INTEGER NOT NULL DEFAULT 1,
     motion_sensitivity TEXT NOT NULL DEFAULT 'medium',
     object_detection_enabled INTEGER NOT NULL DEFAULT 0,
-    object_detection_mode TEXT NOT NULL DEFAULT 'on_motion'
+    object_detection_mode TEXT NOT NULL DEFAULT 'on_motion',
+    record_enabled INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS detection_classes (

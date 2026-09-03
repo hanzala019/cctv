@@ -44,6 +44,7 @@ from core.recording.event_logger import EventLoggerManager
 from core.recording.recording_manager import RecordingManager
 from core.storage.camera_store import CameraStore
 from core.storage.event_store import EventStore, save_event_thumbnail
+from core.storage.settings_store import StorageSettingsStore
 from core.ui.constants import POLL_INTERVAL_MS
 from core.ui.settings import SettingsPanel
 from core.ui.theme import (
@@ -94,7 +95,8 @@ class MainWindow(QMainWindow):
         # Constructed before AlertManager below, since alerts now write
         # into event_store too and need both handed to them.
         self.event_store = EventStore()
-        self.recording = RecordingManager(self.streams, self.event_store)
+        self.settings_store = StorageSettingsStore()
+        self.recording = RecordingManager(self.streams, self.event_store, self.settings_store)
         self.event_logger = EventLoggerManager(self.motion, self.recording, self.event_store)
 
         # Phase 5: alerting. Deliberately NOT wired through
@@ -500,6 +502,12 @@ class MainWindow(QMainWindow):
             }))
         except Exception as exc:
             print(f"[diagnostics] {exc}")
+
+    def get_effective_recording_path(self):
+        """Where recordings actually go right now -- the user's choice
+        if set, otherwise the default. Single source of truth for the
+        fallback rule, so the worker and the UI can't disagree."""
+        return self.settings_store.get_effective_recording_path()
 
     def closeEvent(self, event):
         self._diag_timer.stop()

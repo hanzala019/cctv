@@ -58,6 +58,7 @@ import cv2
 
 from core import paths
 from core.storage.event_store import EventStore
+from core.storage.settings_store import StorageSettingsStore
 from core.worker.manager import WorkerManager
 from core.worker.worker import BackgroundWorker
 
@@ -67,7 +68,7 @@ from core.worker.worker import BackgroundWorker
 # depend on where this module sits in the package tree, so moving the
 # file moved everybody's recordings.
 
-SEGMENT_DURATION_SECONDS = 30 * 60  # 30 minutes, fixed -- see Phase 7 design discussion
+SEGMENT_DURATION_SECONDS = 30 * 60  # 30 minutes
 
 # Frame pull/write cadence. StreamWorker doesn't do frame-rate pacing
 # (it just always holds "the latest frame"), so recording at a fixed
@@ -158,6 +159,7 @@ class RecordingStatus:
     NO_FRAME = "no_frame"        # camera has no decoded frame yet -- mirrors MotionStatus.NO_FRAME
     RECORDING = "recording"      # actively writing to an open segment
     CODEC_ERROR = "codec_error"  # every codec candidate failed to open -- recording is not working
+    PATH_ERROR = "path_error"    # recordings dir unreachable -- unplugged drive, permissions, full disk
     STOPPED = "stopped"
 
 # Once a codec is confirmed to open successfully, remembered here so
@@ -187,10 +189,11 @@ class RecordingWorker(BackgroundWorker):
     # cutting that short risks a truncated segment.
     JOIN_TIMEOUT_SECONDS = 5.0
 
-    def __init__(self, cam_id, stream_manager, event_store):
+    def __init__(self, cam_id, stream_manager, event_store, settings_store):
         super().__init__(cam_id)
         self.stream_manager = stream_manager
         self.event_store = event_store
+        self.settings_store = settings_store
 
         self._lock = threading.Lock()
 
@@ -198,11 +201,13 @@ class RecordingWorker(BackgroundWorker):
         self._writer_frame_size = None  # (w, h) the current writer was opened with
         self._current_segment_id = None
         self._segment_started_at = None
+        self._segment_duration_seconds = SEGMENT_DURATION_SECONDS
         self._current_file_path = None
         # If every codec candidate fails, don't retry on literally
         # every frame (~15x/sec) -- back off and only retry (and only
         # log) once per this interval until it starts working.
         self._next_open_attempt_at = 0.0
+        self._path_error = False
         self._status = RecordingStatus.NO_FRAME
 
         # Forced early rollover state -- see request_early_rollover().
@@ -252,6 +257,14 @@ class RecordingWorker(BackgroundWorker):
         with self._lock:
             return self._status
 
+    def get_segment_duration(self):
+        """The configured segment duration in seconds. Used by the
+        UI to display the current segment's progress bar."""
+        duration_minutes = self.settings_store.get_settings_info()["duration_minutes"]
+        if duration_minutes is None:
+            return SEGMENT_DURATION_SECONDS
+        return duration_minutes * 60 # convert to seconds
+
     def request_early_rollover(self):
         """Called when something worth reviewing soon just happened --
         today, only a fresh object detection (see main.py's
@@ -285,10 +298,12 @@ class RecordingWorker(BackgroundWorker):
 
         self._write_frame(frame)
         with self._lock:
-            self._status = (
-                RecordingStatus.RECORDING if self._writer is not None
-                else RecordingStatus.CODEC_ERROR
-            )
+            if self._writer is not None:
+                self._status = RecordingStatus.RECORDING
+            elif self._path_error:
+                self._status = RecordingStatus.PATH_ERROR
+            else:
+                self._status = RecordingStatus.CODEC_ERROR
 
     def _write_frame(self, frame_bgr):
         now = time.time()
@@ -297,7 +312,7 @@ class RecordingWorker(BackgroundWorker):
             if now < self._next_open_attempt_at:
                 return  # backing off after a recent total codec failure
             self._open_new_segment(frame_bgr)
-        elif now - self._segment_started_at >= SEGMENT_DURATION_SECONDS:
+        elif now - self._segment_started_at >= self._segment_duration_seconds:
             self._close_current_segment()
             self._open_new_segment(frame_bgr)
         elif self._rollover_requested_at is not None and now >= self._rollover_requested_at:
@@ -317,9 +332,29 @@ class RecordingWorker(BackgroundWorker):
         if self._writer is not None and (frame_bgr.shape[1], frame_bgr.shape[0]) == self._writer_frame_size:
             self._writer.write(frame_bgr)
 
+    def _recordings_root(self):
+        """Read per segment-open rather than cached, so a path change
+        takes effect on the next roll without restarting the worker.
+        Once per camera per 30 min, so the DB hit is free; never call
+        this from tick(), which runs at 15 Hz."""
+        return self.settings_store.get_recording_path() or paths.footage_root()
+
     def _open_new_segment(self, first_frame_bgr):
-        cam_dir = os.path.join(paths.footage_root(), self.cam_id)
-        os.makedirs(cam_dir, exist_ok=True)
+        cam_dir = os.path.join(self._recordings_root(), self.cam_id)
+        try:
+            os.makedirs(cam_dir, exist_ok=True)
+        except OSError as e:
+            print(
+                f"[recording_manager] cam={self.cam_id} cannot write to "
+                f"{cam_dir}: {e} -- recording is not working for this camera. "
+                f"Retrying in {OPEN_RETRY_BACKOFF_SECONDS}s."
+            )
+            with self._lock:
+                self._path_error = True
+            self._next_open_attempt_at = time.time() + OPEN_RETRY_BACKOFF_SECONDS
+            return
+        with self._lock:
+            self._path_error = False
 
         h, w = first_frame_bgr.shape[:2]
         writer, file_path = self._open_writer(cam_dir, w, h)
@@ -349,6 +384,7 @@ class RecordingWorker(BackgroundWorker):
             self._current_segment_id = segment_id
             self._segment_started_at = time.time()
             self._current_file_path = file_path
+            self._segment_duration_seconds = self.get_segment_duration()
 
         writer.write(first_frame_bgr)
 
@@ -423,8 +459,9 @@ class _RetentionSweeper:
     RecordingManager itself only to keep RecordingManager's per-camera
     start/stop bookkeeping uncluttered by this unrelated timer."""
 
-    def __init__(self, event_store):
+    def __init__(self, event_store, settings_store):
         self.event_store = event_store
+        self.settings_store = settings_store
         self._thread = None
         self._stop_event = threading.Event()
 
@@ -451,7 +488,10 @@ class _RetentionSweeper:
             self._sweep()
 
     def _sweep(self):
-        cutoff = datetime.now().timestamp() - RETENTION_DAYS * 86400
+        days = self.settings_store.get_settings_info()["retention_days"]
+        if days is None:
+            days = RETENTION_DAYS
+        cutoff = datetime.now().timestamp() - days * 86400
         cutoff_iso = datetime.fromtimestamp(cutoff).isoformat(timespec="seconds")
         try:
             deleted_paths = self.event_store.delete_segments_older_than(cutoff_iso)
@@ -471,15 +511,16 @@ class RecordingManager(WorkerManager):
     """Owns one RecordingWorker per camera plus the single retention
     sweeper thread."""
 
-    def __init__(self, stream_manager, event_store=None):
+    def __init__(self, stream_manager, event_store=None, settings_store=None):
         super().__init__()
         self.stream_manager = stream_manager
         self.event_store = event_store or EventStore()
-        self._retention = _RetentionSweeper(self.event_store)
+        self.settings_store = settings_store or StorageSettingsStore()
+        self._retention = _RetentionSweeper(self.event_store, self.settings_store)
         self._retention.start()
 
     def _make_worker(self, cam_id, **kwargs):
-        return RecordingWorker(cam_id, self.stream_manager, self.event_store)
+        return RecordingWorker(cam_id, self.stream_manager, self.event_store, self.settings_store)
 
     def stop_all(self):
         """Stop every recorder, then the retention sweeper. The sweeper

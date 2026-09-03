@@ -51,6 +51,8 @@ def _under(*parts):
 def cameras_db():
     return _under("cameras.db")
 
+def settings_db():
+    return _under("settings.db")
 
 def events_db():
     return _under("events.db")
