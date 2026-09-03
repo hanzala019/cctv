@@ -7,6 +7,26 @@ StreamWorker/StreamManager and MotionWorker/MotionManager threading
 shape on purpose -- one more background worker per camera, same
 lifecycle contract (start/stop/get_status-style access), different job.
 
+Model resolution
+----------------
+The detector looks for yolov8n.onnx in this order on first inference:
+
+    1. Bundled copy at the install dir (paths.model_path) -- ships with
+       a --add-data build, read-only.
+    2. Previously auto-downloaded copy under data_dir()/models/
+       (paths.downloaded_model_path) -- survives reinstalls of the
+       install dir but lives where CCTV_DATA_DIR points.
+    3. None of the above: download yolov8n.onnx from the ultralytics
+       GitHub release into data_dir()/models/, then load it. Logged on
+       success and failure; no torch/ultralytics dependency is added
+       for this -- it's a plain HTTPS GET via urllib.
+
+The download only happens inside _get_model() under _model_lock, so
+two cameras racing to start their workers will not trigger two
+downloads. A failed download sets _model_load_failed and every later
+inference call is skipped until the process restarts -- matches the
+existing behavior for a missing/unreadable bundled file.
+
 Trigger model
 -------------
 This worker does NOT decode frames or run its own detection loop
@@ -123,8 +143,11 @@ API shape, not against a live camera/model.
 """
 
 import collections
+import os
 import threading
 import time
+import urllib.error
+import urllib.request
 
 import cv2
 import numpy as np
@@ -175,7 +198,22 @@ CHECK_INTERVAL_SECONDS = 0.2  # cadence for checking motion state / continuous t
 # inside a PyInstaller --onefile build. The previous helper resolved
 # against os.path.abspath("."), so launching the app from anywhere other
 # than the repo root silently failed to find the model.
-MODEL_WEIGHTS = paths.model_path("yolov8n.onnx")
+# This is the FALLBACK / download target, not the primary lookup --
+# _get_model() checks the bundled install-dir copy first.
+MODEL_WEIGHTS = paths.downloaded_model_path("yolov8n.onnx")
+
+# Source for the auto-download when no bundled or previously-downloaded
+# yolov8n.onnx is present. Pinned to a specific ultralytics release tag
+# so we never silently pull a different model version than the one the
+# detector was written against. If the user is offline, the download
+# raises and inference is disabled for the rest of the process -- they
+# can still drop a yolov8n.onnx into data_dir()/models/ (or the install
+# dir) and restart.
+MODEL_DOWNLOAD_URL = (
+    "https://github.com/ultralytics/assets/releases/download/v8.3.0/"
+    "yolov8n.onnx"
+)
+MODEL_DOWNLOAD_TIMEOUT_SECONDS = 60
 
 # Quality-of-life: a small preview image of what triggered each
 # detection, shown as a thumbnail in the side panel's log. Captured
@@ -418,13 +456,15 @@ class ONNXYOLODetector:
         image = image.transpose(2, 0, 1)
         image = np.expand_dims(image, axis=0)
 
+        t0 = time.perf_counter()
         outputs = self.session.run(
             None,
             {self.input_name: image},
         )
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[object_detector] inference took {elapsed_ms:.1f} ms")
 
         output = outputs[0]
-
         # YOLOv8 exported output is normally:
         #
         # (1, 84, 8400)
@@ -530,6 +570,44 @@ class ONNXYOLODetector:
         return detections
 
 
+def _resolve_model_path():
+    """Return the first existing yolov8n.onnx we can load, in priority
+    order: bundled install-dir copy (ships with the app) > previously
+    auto-downloaded copy under data_dir()/models/. Returns None if
+    neither exists -- caller is then responsible for triggering a
+    download."""
+    bundled = paths.model_path("yolov8n.onnx")
+    if os.path.isfile(bundled):
+        return bundled
+    downloaded = paths.downloaded_model_path("yolov8n.onnx")
+    if os.path.isfile(downloaded):
+        return downloaded
+    return None
+
+
+def _download_model(url, destination):
+    """Stream the ONNX weights to `destination` via urllib. Uses
+    stdlib only -- no new dependency for what is fundamentally one
+    HTTPS GET. Creates the parent directory, writes atomically via a
+    .part temp file so a partial download never silently replaces a
+    good one."""
+    parent = os.path.dirname(destination)
+    os.makedirs(parent, exist_ok=True)
+
+    tmp_path = destination + ".part"
+    request = urllib.request.Request(url, headers={"User-Agent": "cctv-app/1.0"})
+
+    with urllib.request.urlopen(request, timeout=MODEL_DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with open(tmp_path, "wb") as out:
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+
+    os.replace(tmp_path, destination)
+
+
 def _get_model():
     """
     Lazily load the shared YOLOv8n ONNX model.
@@ -539,7 +617,11 @@ def _get_model():
         - torchvision
         - ultralytics
 
-    Inference is performed entirely by ONNX Runtime on CPU.
+    Inference is performed entirely by ONNX Runtime on CPU. The model
+    is loaded from the first available source: bundled install-dir
+    copy, then a previously auto-downloaded copy under data_dir(),
+    then a fresh HTTPS download into data_dir() -- see
+    _resolve_model_path and _download_model.
     """
 
     global _shared_model, _model_load_failed
@@ -548,21 +630,45 @@ def _get_model():
         return _shared_model
 
     with _model_lock:
-        if _shared_model is None and not _model_load_failed:
+        if _shared_model is not None or _model_load_failed:
+            return _shared_model
+
+        weights_path = _resolve_model_path()
+        if weights_path is None:
+            target = MODEL_WEIGHTS
+            print(
+                "[object_detector] "
+                f"yolov8n.onnx not found locally, downloading from {MODEL_DOWNLOAD_URL}"
+            )
             try:
-                _shared_model = ONNXYOLODetector(MODEL_WEIGHTS)
-
+                _download_model(MODEL_DOWNLOAD_URL, target)
                 print(
                     "[object_detector] "
-                    "Using YOLOv8n ONNX Runtime on CPU"
+                    f"Downloaded model to {target}"
                 )
-
-            except Exception as exc:
+                weights_path = target
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 print(
                     "[object_detector] "
-                    f"Failed to load ONNX model: {exc}"
+                    f"Failed to download ONNX model: {exc}"
                 )
                 _model_load_failed = True
+                return None
+
+        try:
+            _shared_model = ONNXYOLODetector(weights_path)
+
+            print(
+                "[object_detector] "
+                f"Using YOLOv8n ONNX Runtime on CPU ({weights_path})"
+            )
+
+        except Exception as exc:
+            print(
+                "[object_detector] "
+                f"Failed to load ONNX model: {exc}"
+            )
+            _model_load_failed = True
 
     return _shared_model
 

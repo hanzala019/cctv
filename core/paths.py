@@ -87,3 +87,11 @@ def model_path(filename="yolov8n.onnx"):
     are --add-data resources rather than user data."""
     base = getattr(sys, "_MEIPASS", None) or _install_dir()
     return os.path.join(base, "models", filename)
+
+
+def downloaded_model_path(filename="yolov8n.onnx"):
+    """Writable location for an auto-downloaded model, under data_dir()
+    rather than next to the exe -- the install dir is often read-only
+    or per-user-installer-managed, while data_dir() is guaranteed
+    writable and is what CCTV_DATA_DIR already overrides."""
+    return _under("models", filename)
