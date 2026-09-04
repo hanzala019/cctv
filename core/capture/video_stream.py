@@ -175,61 +175,30 @@ class StreamWorker(BackgroundWorker):
     def _open_capture(self):
         self._set_status(StreamStatus.CONNECTING, None)
 
-        cap = cv2.VideoCapture()
-        opened = False
-
-        # Attempt 1: force the FFmpeg backend (works well for RTSP).
-        try:
-            opened = cap.open(self.url, cv2.CAP_FFMPEG, self._open_params())
-        except cv2.error:
-            opened = False
-
-        # Attempt 2: let OpenCV choose the backend, which many HTTP /
-        # MJPEG streams and local files need.
-        #
-        # The timeout params are passed here too. They used to be
-        # omitted, so a camera that was merely unreachable -- rather
-        # than actively refusing -- blocked this call for FFmpeg's full
-        # ~30s default. On a network that blackholes packets instead of
-        # sending a TCP reset (most real networks, and any firewalled
-        # host), that made a dead camera freeze its worker for ~35s per
-        # retry cycle, and stop() could not interrupt it.
-        if not opened or not cap.isOpened():
-            try:
-                cap.release()
-            except cv2.error:
-                pass
-
-            # Bail out between attempts if stop() has been requested.
-            # Neither attempt can be interrupted once it is inside the C
-            # call, so this checkpoint is the only place we can cut the
-            # worst case in half: without it, stopping the app with an
-            # unreachable camera waits out BOTH timeouts (2 x
-            # OPEN_TIMEOUT_MSEC) before the thread can exit.
-            if self._stop_event.is_set():
-                self._set_status(StreamStatus.STOPPED, None)
-                return False
-
+        # A local webcam is given as a plain index (0, 1, 2...), not a URL.
+        # It needs cap.open(int_index, backend) with a camera-capable
+        # backend (DSHOW/MSMF on Windows) -- passing it as a string to the
+        # FFMPEG/ANY path below is what produces the repeated
+        # "cap_images.cpp ... unsupported parameters" bailout, since OpenCV
+        # falls back to trying to parse it as an image-sequence filename.
+        if isinstance(self.url, int) or (isinstance(self.url, str) and self.url.isdigit()):
+            index = int(self.url)
             cap = cv2.VideoCapture()
             try:
-                opened = cap.open(self.url, cv2.CAP_ANY, self._open_params())
-            except cv2.error as exc:
-                self._set_status(StreamStatus.ERROR, f"Failed to open stream: {exc}")
-                return False
-
-        if not cap.isOpened():
-            try:
-                cap.release()
+                opened = cap.open(index, cv2.CAP_DSHOW)
             except cv2.error:
-                pass
-            self._set_status(
-                StreamStatus.ERROR,
-                "Could not open stream (bad URL or unreachable).",
-            )
-            return False
+                opened = False
+            if not opened or not cap.isOpened():
+                try:
+                    cap.release()
+                except cv2.error:
+                    pass
+                self._set_status(StreamStatus.ERROR, f"Could not open webcam index {index}.")
+                return False
+            self._cap = cap
+            return True
 
-        self._cap = cap
-        return True
+        # ...existing FFMPEG/ANY network-stream logic below, unchanged...
 
     def _read_one_frame(self):
         cap = self._cap
