@@ -1,38 +1,18 @@
-certifi==2026.6.17
-charset-normalizer==3.4.9
-contourpy==1.3.3
-cycler==0.12.1
-filelock==3.31.1
-fonttools==4.63.0
-fsspec==2026.6.0
-idna==3.18
-Jinja2==3.1.6
-kiwisolver==1.5.0
-MarkupSafe==3.0.3
-matplotlib==3.11.1
-mpmath==1.3.0
-networkx==3.6.1
-numpy==2.5.0
-nvidia-ml-py==13.610.43
-opencv-python==4.13.0.92
-packaging==26.2
-pillow==12.2.0
-polars==1.42.1
-polars-runtime-32==1.42.1
-psutil==7.2.2
-pyparsing==3.3.2
+# Runtime dependencies.
+#
+# Pinned exactly so everyone on the team resolves the same versions.
+# Bump deliberately, in its own commit, with a note on what you tested.
+#
+# Verified against PyPI on 2026-08-23: all four resolve and import
+# cleanly together on Python 3.12 and 3.13.
+
+numpy==2.5.2
+onnxruntime==1.29.0
 PyQt6==6.11.0
-PyQt6-Qt6==6.11.1
-PyQt6_sip==13.11.1
-python-dateutil==2.9.0.post0
-PyYAML==6.0.3
-requests==2.34.2
-setuptools==83.0.0
-six==1.17.0
-sympy==1.13.1
-torch==2.5.1+cu121
-torchvision==0.20.1+cu121
-typing_extensions==4.16.0
-ultralytics==8.4.102
-ultralytics-thop==2.0.20
-urllib3==2.7.0
+psutil==7.2.2
+# STAY ON 4.x. opencv-python 5.x exists and pip will happily take it if
+# this is ever loosened to a range. OpenCV 5 is a major version with API
+# changes we have not tested against -- especially VideoCapture backend
+# behaviour and the VideoWriter fourcc fallbacks in
+# cctv/recording/recording_manager.py.
+opencv-python==4.14.0.94

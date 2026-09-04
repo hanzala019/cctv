@@ -1,0 +1,20 @@
+# Auto-request review from whoever owns each area.
+# Replace the placeholders with real GitHub handles.
+
+# Storage schema is the contract everyone depends on -- always reviewed.
+/core/storage/          @adnanjami @hanzala019
+/core/worker/           @adnanjami @hanzala019
+
+/core/capture/          @hanzala019 @adnanjami
+/core/detection/        @hanzala019 @adnanjami
+/core/recording/        @hanzala019 @adnanjami
+/core/alerts/           @hanzala019 @adnanjami
+
+/core/ui/widgets/       @trulyfalse
+/core/ui/views/         @trulyfalse
+/core/ui/settings/      @trulyfalse
+/core/ui/theme.py       @trulyfalse
+
+# Wiring hub -- highest conflict risk, keep changes small.
+/core/ui/app.py         @trulyfalse @hanzala019 @adnanjami
+/main.py                @trulyfalse @hanzala019 @adnanjami
